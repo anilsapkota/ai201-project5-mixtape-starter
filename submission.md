@@ -48,3 +48,45 @@ correctly incremented it to 2 — confirming the fix works through the same code
 path used to reproduce the bug, not just in isolation.
 
 
+### Issue #5: The last song in a playlist never shows up
+
+**Issue number and title:** Issue #5 — The last song in a playlist never shows up
+
+**How you reproduced it:**
+I traced the entry point first: `GET /playlists/<playlist_id>/songs` in
+`routes/playlists.py` calls `get_playlist_songs(playlist_id)` in
+`playlist_service.py`. I found a real playlist ID in `flask shell` via
+`Playlist.query.first().id`, then ran `get_playlist_songs()` on it directly and
+got `len(songs) == 6`. To confirm that was actually wrong (not just assume it),
+I independently counted how many songs were really linked to that playlist by
+querying the `playlist_entries` association table directly, bypassing the
+function under test entirely: `db.session.query(playlist_entries).filter(...).count()`
+returned `7`. The 6-vs-7 mismatch confirmed the bug — exactly one song was
+missing from every playlist's result.
+
+**How you found the root cause:**
+I read `get_playlist_songs()` in full, including its docstring, before forming
+any theory. The docstring's `Note:` block explicitly states "This function
+returns all songs in the playlist," directly above a `return` statement that
+does `[song.to_dict() for song in songs[:-1]]`. The query building `songs` above
+that line is correct — it joins `playlist_entries`, filters by playlist, and
+orders by `position` ascending, so it already fetches every song in the right
+order. The contradiction between the docstring's explicit claim and the slice
+on the very next meaningful line was the moment of confidence: this wasn't a
+query bug, it was a slicing bug applied after the correct data was already fetched.
+
+**The root cause:**
+The final line of `get_playlist_songs()` returns `songs[:-1]` instead of `songs`.
+In Python, `list[:-1]` returns every element except the last one. Since `songs`
+already holds the complete, correctly-ordered result of the query, this slice
+unconditionally drops the last song (by position) from every playlist's result,
+regardless of how many songs the playlist actually has — a stray slice applied
+after correct data retrieval, not a flaw in the query itself.
+
+**Your fix and side-effect check:**
+Changed `songs[:-1]` to `songs`. Verified by re-running the same two checks from
+reproduction after restarting `flask shell` (to avoid testing stale, already-imported
+code): `get_playlist_songs()` now returns `len(songs) == 7`, matching the independent
+`playlist_entries` count of `7`. I also reasoned through the empty-playlist edge case
+by hand: `[][:-1]` and `[]` both evaluate to `[]`, so a playlist with zero songs was
+never affected by this bug either way — no regression risk there.
