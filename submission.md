@@ -133,3 +133,81 @@ exactly: after `db.session.commit()`, if `song.shared_by != user_id`, call
 Verified via `flask shell` after restarting the session (to avoid running stale,
 already-imported code): calling `rate_song()` with a rater different from the
 song's
+
+## AI Usage
+
+I used Claude as a guided pairing partner rather than to generate answers directly —
+for each bug, Claude asked me to find the entry point, form a hypothesis, and verify
+it myself before confirming anything, only stepping in when I was genuinely stuck.
+
+**What I asked it to explain/trace:** For each bug, I had it help me confirm which
+route file and endpoint actually called into the relevant service function, since
+the assignment discourages skipping straight to the service file. For Issue #4, I
+specifically asked it to compare `add_to_playlist()` and `rate_song()` side by side,
+since the bug wasn't a wrong condition but a missing block, and reading the broken
+function alone never would have surfaced that on its own.
+
+**What it helped me understand:** Python's `.weekday()` convention (Monday=0 ...
+Sunday=6, versus the separate `isoweekday()` method which numbers differently) —
+I initially assumed the fix for Issue #1 was changing `!= 6` to `!= 7`, which
+Claude had me check against the actual `.weekday()` range before I made that
+mistake in the code. It also walked me through what Python list slicing
+(`songs[:-1]`) actually does, which was the entire root cause of Issue #5.
+
+**Where I had to verify or push back myself, or got tripped up:**
+- I hit a stale-code trap twice — after editing `streak_service.py` and later
+  `playlist_service.py`, I re-ran tests in the same `flask shell` session and got
+  the *old* buggy behavior back, because `flask shell` only imports code once at
+  startup. I had to learn to `exit()` and restart the shell after every code change
+  before re-testing.
+- For Issue #1, I initially tried reusing a Saturday/Sunday date pair from an
+  earlier test without checking that it was still *after* the user's current
+  `last_listened_at` in the database — Claude had me check the actual current
+  state first rather than assume it, which caught the mistake before I ran it.
+- I ran into PowerShell vs. Git Bash syntax differences trying to set
+  `FLASK_APP` inline, and got a red herring 404 on the bare `/` root URL that
+  turned out to just be an unregistered route, not an actual problem.
+- For Issue #5, I verified the fix by independently counting rows in the
+  `playlist_entries` table directly, rather than trusting the same function I
+  was testing — that's what gave me real proof (6 vs. 7) instead of just an
+  assumption that my read of the code was correct.
+- I did not end up verifying every edge case for every bug (e.g. Issue #4's
+  self-rating guard and repeated-rating behavior weren't separately tested in
+  this session) — flagging that honestly rather than claiming full coverage.
+
+  ## Codebase Map
+
+**Main files and their roles:**
+- `app.py` — Flask application factory. Registers four blueprints (`songs`,
+  `playlists`, `users`, `feed`) and initializes the SQLAlchemy `db` object.
+- `models.py` — All SQLAlchemy models: `User`, `Song`, `Tag`, `ListeningEvent`,
+  `Rating`, `Playlist`, `Notification`, plus association tables for friendships,
+  song tags, and playlist entries (the last one has an explicit `position` column,
+  so playlist order is stored data, not just insertion order).
+- `routes/` — Thin controllers. Every route I looked at (`songs.py`, `playlists.py`,
+  `users.py`) parses the request and immediately calls exactly one function in
+  `services/`. No business logic lives in the routes themselves.
+- `services/streak_service.py` — `record_listening_event()` is the entry point
+  called from `POST /songs/<id>/listen`; it hardcodes the current time internally
+  and delegates the actual streak math to `update_listening_streak(user, now)`,
+  which is a pure function I could call directly with a controlled datetime to
+  test specific day transitions without waiting for the calendar.
+- `services/playlist_service.py` — `get_playlist_songs()` (called from
+  `GET /playlists/<id>/songs`) correctly queries and orders songs by `position`,
+  but had a stray slice on the final return line.
+- `services/notification_service.py` — `create_notification()` is the generic
+  helper. `add_to_playlist()` (called from `POST /playlists/<id>/songs`) follows
+  the correct pattern: perform the action, then notify the original sharer if
+  they weren't the one who acted. `rate_song()` (called from
+  `POST /songs/<id>/rate`) performed the action but never called the notify step.
+
+**Data flow — rating a song vs. adding to a playlist:**
+Both actions are meant to notify the song's original sharer, but only route
+through similarly-shaped functions in the same file. Comparing them directly
+(rather than reading either one in isolation) is what exposed that one had a
+step the other was missing entirely.
+
+**Pattern noticed:** Every bug I found was located either by (1) a contradiction
+between a function's own docstring and its actual code, or (2) comparing a
+working code path against a structurally similar broken one. Neither required
+guessing — both just required reading carefully and having a reference point.
